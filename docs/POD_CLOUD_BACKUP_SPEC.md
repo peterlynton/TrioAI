@@ -100,6 +100,42 @@ The solution is BLE re-discovery: on the new device, scan for nearby Dash pods a
 
 The backup feature reuses this serialization pathway — the same `rawValue` dictionary that gets written to disk locally also gets encrypted and uploaded to Firestore.
 
+### 4.3.1 JSON Serialization Hazard: `Date` Objects in rawValue
+
+> **Added during code review — April 2026**
+
+The `rawValue` dictionaries contain raw `Date` objects that are **not JSON-serializable**. `JSONSerialization.data(withJSONObject:)` will throw if any `Date` values are present. This does not affect local persistence (iOS `UserDefaults`/plist natively supports `Date`), but **will break the cloud backup pipeline**.
+
+**Affected date fields in `PodState.rawValue`** (PodState.swift lines 551–555):
+- `activatedAt` → stored as `Date?`
+- `expiresAt` → stored as `Date?`
+- `podTimeUpdated` → stored as `Date?`
+- `primeFinishTime` → stored as `Date?`
+
+**Affected date field in `OmniBLEPumpManagerState.rawValue`** (OmniBLEPumpManagerState.swift line 271):
+- `lastPumpDataReportDate` → stored as `Date?`
+
+**Fields that look like dates but are NOT** (do not convert):
+- `podTime` → `TimeInterval` (Double, duration since pod activation)
+- `activeTime` → `TimeInterval?` (Double, total active duration)
+- `setupUnitsDelivered` → `Double?`
+
+**Required solution:** A pre-serialization conversion layer that:
+1. Recursively walks the `[String: Any]` dictionary before JSON encoding
+2. Converts known `Date` keys to `Double` via `.timeIntervalSinceReferenceDate`
+3. On deserialization, converts those same keys back to `Date` via `Date(timeIntervalSinceReferenceDate:)`
+4. Uses an explicit allowlist of date keys to avoid misidentifying `TimeInterval` duration fields as dates
+
+**Date key allowlist:**
+```swift
+private static let dateKeys: Set<String> = [
+    "activatedAt", "expiresAt", "podTimeUpdated",
+    "primeFinishTime", "lastPumpDataReportDate"
+]
+```
+
+This conversion layer must be unit-tested as part of Phase 1. See Phase 1 task list.
+
 ### 4.4 Session Re-Establishment
 
 Session establishment signature (from `PodComms.swift:236`):
@@ -383,12 +419,20 @@ Two devices sending commands to the same pod with out-of-sync sequence numbers w
 
 ### 10.1 Lock Acquisition
 
+> **Updated during code review — April 2026:** Must use Firestore transactions to prevent race conditions.
+
 When a new device restores from backup:
 
-1. Read `deviceLock/current`
-2. If `lastHeartbeat` is older than 10 minutes, the old device is presumed dead — take the lock
-3. Write new device's ID to `deviceLock/current`
-4. Old device, upon next app foreground, reads the lock and sees it no longer holds it
+1. Run a **Firestore transaction** (`Firestore.runTransaction`) that atomically:
+   a. Reads `deviceLock/current`
+   b. Checks if `lastHeartbeat` is older than 30 minutes (see note below), or `activeDeviceId` is nil
+   c. If stale/unlocked: writes new device's ID, updates `acquiredAt` and `lastHeartbeat`
+   d. If NOT stale: transaction aborts — user is shown a warning that the old device may still be active
+2. Old device, upon next app foreground, reads the lock and sees it no longer holds it
+
+> **Why transactions:** The original read-then-write approach has a TOCTOU race condition — two devices could both read a stale lock and both claim it. Firestore transactions provide optimistic concurrency control and will retry or abort on conflict.
+>
+> **Why 30 minutes instead of 10:** A 10-minute staleness window is too tight. iOS aggressively suspends background apps, and network interruptions during travel (the primary use case) can easily prevent heartbeat writes for >10 minutes while the old device is still alive. A 30-minute window reduces the risk of accidental lock takeover. In the disaster scenario (phone lost/destroyed), 30 minutes is an acceptable wait. For intentional transfers, use the explicit handoff flow (Section 10.4) which is instant.
 
 ### 10.2 Lock Lost — Old Device Behavior
 
