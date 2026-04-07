@@ -100,6 +100,42 @@ The solution is BLE re-discovery: on the new device, scan for nearby Dash pods a
 
 The backup feature reuses this serialization pathway — the same `rawValue` dictionary that gets written to disk locally also gets encrypted and uploaded to Firestore.
 
+### 4.3.1 JSON Serialization Hazard: `Date` Objects in rawValue
+
+> **Added during code review — April 2026**
+
+The `rawValue` dictionaries contain raw `Date` objects that are **not JSON-serializable**. `JSONSerialization.data(withJSONObject:)` will throw if any `Date` values are present. This does not affect local persistence (iOS `UserDefaults`/plist natively supports `Date`), but **will break the cloud backup pipeline**.
+
+**Affected date fields in `PodState.rawValue`** (PodState.swift lines 551–555):
+- `activatedAt` → stored as `Date?`
+- `expiresAt` → stored as `Date?`
+- `podTimeUpdated` → stored as `Date?`
+- `primeFinishTime` → stored as `Date?`
+
+**Affected date field in `OmniBLEPumpManagerState.rawValue`** (OmniBLEPumpManagerState.swift line 271):
+- `lastPumpDataReportDate` → stored as `Date?`
+
+**Fields that look like dates but are NOT** (do not convert):
+- `podTime` → `TimeInterval` (Double, duration since pod activation)
+- `activeTime` → `TimeInterval?` (Double, total active duration)
+- `setupUnitsDelivered` → `Double?`
+
+**Required solution:** A pre-serialization conversion layer that:
+1. Recursively walks the `[String: Any]` dictionary before JSON encoding
+2. Converts known `Date` keys to `Double` via `.timeIntervalSinceReferenceDate`
+3. On deserialization, converts those same keys back to `Date` via `Date(timeIntervalSinceReferenceDate:)`
+4. Uses an explicit allowlist of date keys to avoid misidentifying `TimeInterval` duration fields as dates
+
+**Date key allowlist:**
+```swift
+private static let dateKeys: Set<String> = [
+    "activatedAt", "expiresAt", "podTimeUpdated",
+    "primeFinishTime", "lastPumpDataReportDate"
+]
+```
+
+This conversion layer must be unit-tested as part of Phase 1. See Phase 1 task list.
+
 ### 4.4 Session Re-Establishment
 
 Session establishment signature (from `PodComms.swift:236`):
@@ -130,7 +166,7 @@ The primary strategy is to serialize the entire `OmniBLEPumpManagerState.rawValu
 |---|---|---|---|
 | `ltk` | `Data` | `"ltk"` (hex string) | Master secret; required to establish any new session |
 | `address` | `UInt32` | `"address"` | Pod address for BLE targeting and re-discovery matching |
-| `bleIdentifier` | `String?` | `"bleIdentifier"` | Stored but replaced during re-discovery on new device |
+| `bleIdentifier` | `String` | `"bleIdentifier"` | **Non-optional** (verified). Stored but replaced during re-discovery on new device |
 | `activatedAt` | `Date?` | `"activatedAt"` | Pod start time; needed for expiry calculation |
 | `expiresAt` | `Date?` | `"expiresAt"` | Pod expiry; used for Firestore TTL and UI |
 | `lotNo` | `UInt32` | `"lotNo"` | Lot number; used for re-discovery advertisement matching |
@@ -145,16 +181,18 @@ The primary strategy is to serialize the entire `OmniBLEPumpManagerState.rawValu
 | `unfinalizedResume` | `UnfinalizedDose?` | `"unfinalizedResume"` | In-flight resume not yet confirmed |
 | `finalizedDoses` | `[UnfinalizedDose]` | `"finalizedDoses"` | Completed doses pending upload |
 | `configuredAlerts` | `[AlertSlot: PodAlert]` | `"configuredAlerts"` | Alerts currently configured on pod |
-| `activeAlertSlots` | `AlertSet` | `"activeAlertSlots"` | Currently firing alerts |
+| `activeAlertSlots` | `AlertSet` | `"alerts"` | Currently firing alerts. **Note:** rawValue key is `"alerts"`, not `"activeAlertSlots"` |
 | `setupProgress` | `SetupProgress` | `"setupProgress"` | Is the pod fully activated? |
-| `firmwareVersion` | `FirmwareVersion` | `"firmwareVersion"` | Pod firmware; protocol compatibility |
-| `bleFirmwareVersion` | `FirmwareVersion` | `"bleFirmwareVersion"` | BLE chip firmware version |
+| `firmwareVersion` | `String` | `"firmwareVersion"` | Pod firmware; protocol compatibility. **Note:** type is `String`, not `FirmwareVersion` |
+| `bleFirmwareVersion` | `String` | `"bleFirmwareVersion"` | BLE chip firmware version. **Note:** type is `String`, not `FirmwareVersion` |
 | `podTime` | `TimeInterval` | `"podTime"` | Time elapsed on pod clock |
 | `podTimeUpdated` | `Date?` | `"podTimeUpdated"` | When pod time was last read |
 | `activeTime` | `TimeInterval?` | `"activeTime"` | Total active time |
 | `fault` | `DetailedStatus?` | `"fault"` | Pod fault state if any |
 | `unacknowledgedCommand` | `PendingCommand?` | `"unacknowledgedCommand"` | Command awaiting acknowledgment |
 | `messageTransportState` | `MessageTransportState` | `"messageTransportState"` | Full session counter state (see below) |
+| `setupUnitsDelivered` | `Double?` | `"setupUnitsDelivered"` | **Missing from original spec.** Units delivered during pod setup/priming |
+| `primeFinishTime` | `Date?` | `"primeFinishTime"` | **Missing from original spec.** When pod priming completed |
 
 **Fields on `MessageTransportState`** (nested in `PodState.rawValue["messageTransportState"]`):
 
@@ -164,8 +202,8 @@ The primary strategy is to serialize the entire `OmniBLEPumpManagerState.rawValu
 | `msgSeq` | `Int` | `"msgSeq"` | Message packet sequence number |
 | `nonceSeq` | `Int` | `"nonceSeq"` | Nonce counter; must not repeat |
 | `messageNumber` | `Int` | `"messageNumber"` | Omnipod command sequence |
-| `ck` | `Data` | `"ck"` | Current session cipher key (ephemeral) |
-| `noncePrefix` | `Data` | `"noncePrefix"` | Current nonce prefix (ephemeral) |
+| `ck` | `Data?` | `"ck"` | Current session cipher key (ephemeral). **Note:** optional (`Data?`), nil before first session |
+| `noncePrefix` | `Data?` | `"noncePrefix"` | Current nonce prefix (ephemeral). **Note:** optional (`Data?`), nil before first session |
 
 **Additional top-level fields on `OmniBLEPumpManagerState`** (`OmniBLE/OmniBLE/PumpManager/OmniBLEPumpManagerState.swift`):
 
@@ -381,12 +419,20 @@ Two devices sending commands to the same pod with out-of-sync sequence numbers w
 
 ### 10.1 Lock Acquisition
 
+> **Updated during code review — April 2026:** Must use Firestore transactions to prevent race conditions.
+
 When a new device restores from backup:
 
-1. Read `deviceLock/current`
-2. If `lastHeartbeat` is older than 10 minutes, the old device is presumed dead — take the lock
-3. Write new device's ID to `deviceLock/current`
-4. Old device, upon next app foreground, reads the lock and sees it no longer holds it
+1. Run a **Firestore transaction** (`Firestore.runTransaction`) that atomically:
+   a. Reads `deviceLock/current`
+   b. Checks if `lastHeartbeat` is older than 30 minutes (see note below), or `activeDeviceId` is nil
+   c. If stale/unlocked: writes new device's ID, updates `acquiredAt` and `lastHeartbeat`
+   d. If NOT stale: transaction aborts — user is shown a warning that the old device may still be active
+2. Old device, upon next app foreground, reads the lock and sees it no longer holds it
+
+> **Why transactions:** The original read-then-write approach has a TOCTOU race condition — two devices could both read a stale lock and both claim it. Firestore transactions provide optimistic concurrency control and will retry or abort on conflict.
+>
+> **Why 30 minutes instead of 10:** A 10-minute staleness window is too tight. iOS aggressively suspends background apps, and network interruptions during travel (the primary use case) can easily prevent heartbeat writes for >10 minutes while the old device is still alive. A 30-minute window reduces the risk of accidental lock takeover. In the disaster scenario (phone lost/destroyed), 30 minutes is an acceptable wait. For intentional transfers, use the explicit handoff flow (Section 10.4) which is instant.
 
 ### 10.2 Lock Lost — Old Device Behavior
 
@@ -535,16 +581,30 @@ This follows the multi-app Firebase pattern already established in the codebase.
 **Goal:** Prove the core technical loop end-to-end in unit tests: serialize pod state → encrypt → store → retrieve → decrypt → restore.
 
 **Tasks:**
-- [ ] Create `PodCloudBackupService.swift`
-- [ ] Implement PBKDF2-SHA256 key derivation (CommonCrypto, 600k iterations)
-- [ ] Implement AES-256-GCM encrypt/decrypt (CryptoKit `AES.GCM`)
+- [ ] Create `Trio/Sources/Services/Backup/BackupCryptoService.swift`
+  - `generateSalt() -> Data` (32 bytes via `SecRandomCopyBytes`)
+  - `deriveKey(passphrase: String, salt: Data) -> SymmetricKey` (PBKDF2-SHA256, 600k iterations via `CCKeyDerivationPBKDF`)
+  - `encrypt(plaintext: Data, key: SymmetricKey) -> EncryptedPayload` (AES-256-GCM via CryptoKit `AES.GCM.seal`)
+  - `decrypt(payload: EncryptedPayload, key: SymmetricKey) -> Data` (AES-256-GCM via `AES.GCM.open`)
+- [ ] Create `Trio/Sources/Services/Backup/BackupSerializer.swift`
+  - `toJSON(rawValue: [String: Any]) -> Data` — recursively converts `Date` fields to `TimeInterval` then JSON-encodes (see Section 4.3.1)
+  - `fromJSON(data: Data) -> [String: Any]` — JSON-decodes then converts known date keys back to `Date`
+  - Uses explicit date key allowlist: `activatedAt`, `expiresAt`, `podTimeUpdated`, `primeFinishTime`, `lastPumpDataReportDate`
+- [ ] Create `Trio/Sources/Services/Backup/BackupDocument.swift` — Codable models for the three Firestore documents (Section 8)
 - [ ] Implement Firestore document write for pod state payload
 - [ ] Implement Firestore document read for pod state payload
-- [ ] Unit test: encrypt/decrypt round-trip produces identical data
-- [ ] Unit test: `OmniBLEPumpManagerState.rawValue` → JSON → parse → reconstruct with no field loss
-- [ ] Unit test: verify all fields from Section 5.1 tables survive round-trip (pay special attention to `Data` fields serialized as hex, `Date` fields, nested `MessageTransportState`)
+- [ ] **Unit tests (all required to pass before Phase 2):**
+  - [ ] Crypto round-trip: encrypt → decrypt produces identical data
+  - [ ] Wrong passphrase: decrypt with wrong key throws `CryptoKit.CryptoKitError`
+  - [ ] Date conversion: `Date` → `TimeInterval` → `Date` round-trip preserves values; `podTime`/`activeTime` are NOT converted
+  - [ ] `OmniBLEPumpManagerState.rawValue` → `toJSON()` → `fromJSON()` → `init?(rawValue:)` round-trip with no field loss
+  - [ ] Every field from Section 5.1 individually verified after round-trip (set each to non-default, assert identical after restore)
+  - [ ] Full pipeline: `rawValue` → JSON → encrypt → decrypt → JSON → `rawValue` → reconstruct state
+  - [ ] `previousPodState` handling: verify whether to strip or preserve (document decision)
+  - [ ] `configuredAlerts` serialization: verify `[String: [String: Any]]` structure survives JSON round-trip
+- [ ] Benchmark PBKDF2 at 600k iterations on oldest target device (iPhone 11). If >2s, document tradeoff and run on background thread.
 
-**Success criteria:** A test that takes a real `OmniBLEPumpManagerState`, serializes it, encrypts it, decrypts it, and reconstructs an identical state with no data loss.
+**Success criteria:** A test that takes a realistic `OmniBLEPumpManagerState` with all fields populated (including nested `PodState`, `MessageTransportState`, `configuredAlerts`, `unfinalizedBolus`), serializes it to JSON, encrypts it, decrypts it, deserializes it, and reconstructs an identical state with no data loss.
 
 ---
 
@@ -640,7 +700,66 @@ This follows the multi-app Firebase pattern already established in the codebase.
 | 7 | Two physical phones online simultaneously attempt to sync conflicting state. | High | Device lock (Section 10) prevents this. Last-write-wins acceptable only if lock is correctly enforced. |
 | 8 | Pod firmware update changes advertisement format, breaking re-discovery. | Low | `PodAdvertisement.swift` parsing is the single point to update. Abstract re-discovery matching behind an interface for easy future updates. |
 | 9 | `OmniBLEPumpManagerState.podState` is optional (`PodState?`). Recovery with nil podState. | Medium | If `podState` is nil in the backup, there is no pod to recover. Detect this in the preview step (Step 7 of recovery flow) and inform the user no active pod backup exists. |
+| 10 | **NEW:** `rawValue` contains raw `Date` objects that break `JSONSerialization`. | **Critical** | Must implement a Date↔TimeInterval conversion layer before JSON encoding. See Section 4.3.1. Five date fields identified, three non-date `TimeInterval` fields must NOT be converted. Requires explicit allowlist. |
+| 11 | **NEW:** Device lock acquisition has TOCTOU race condition. | **High** | Original read-then-write is not atomic. Must use `Firestore.runTransaction` for lock acquisition. See updated Section 10.1. |
+| 12 | **NEW:** `previousPodState` in backup doubles payload and exposes old LTK. | **Medium** | `OmniBLEPumpManagerState.rawValue` includes `previousPodState` (the prior pod's full state including its LTK). This old LTK is not needed for recovery and is unnecessary sensitive data exposure. Consider stripping `previousPodState` from the payload before encryption, or accept the risk with documentation. |
+| 13 | **NEW:** Email-based MFA is weak for insulin pump security. | **Medium** | If attacker has Firebase email/password, they likely also have email access. Recommend TOTP (Firebase supports it) as the primary MFA method. Document the risk of email-only MFA in setup flow. |
+| 14 | **NEW:** No proactive backup integrity verification. | **Medium** | AES-GCM authentication detects tampering, but a corrupted/invalid backup is only discovered during an emergency. Add a periodic background health check: decrypt the backup and validate it deserializes to a valid `OmniBLEPumpManagerState`. Surface failures as a persistent warning. |
+| 15 | **NEW:** `bleIdentifier` is non-optional `String`, not `String?`. | **Low** | Cannot set to nil during recovery before re-discovery. On restoration, set to a placeholder value (e.g., empty string or UUID placeholder) before BLE scan, then update with the real CoreBluetooth UUID after pod is found. |
 
 ---
 
-*This document is a pre-implementation specification. It describes intent and design, not completed code. All implementation decisions are subject to revision as development proceeds. Validated against OmniBLE commit d8375ebf, November 2025.*
+## 17. Code Review Findings — April 2026
+
+> This section documents the results of verifying every claim in this spec against the actual OmniBLE source code at commit `d8375ebf`.
+
+### 17.1 All Claims Verified Correct
+
+| Claim | Source File | Status |
+|---|---|---|
+| PodState conforms to `RawRepresentable` with `[String: Any]` | `PodState.swift:55-57` | Verified |
+| MessageTransportState conforms to `RawRepresentable` | `MessageTransport.swift:20-21` | Verified |
+| OmniBLEPumpManagerState wraps `PodState?` (optional) | `OmniBLEPumpManagerState.swift:20` | Verified |
+| OmniBLEPumpManagerState has `init?(rawValue:)` | `OmniBLEPumpManagerState.swift:120` | Verified |
+| `establishSession` is `private` with signature `(ltk: Data, eapSeq: Int, msgSeq: Int = 1)` | `PodComms.swift:236` | Verified |
+| LTKExchanger uses CryptoKit `Curve25519.KeyAgreement` | `X25519KeyGenerator.swift:13` | Verified |
+| LTK is 16 bytes | `LTKExchanger.swift:104-106` | Verified |
+| SessionEstablisher derives `ck`/`noncePrefix` via Milenage | `SessionEstablisher.swift:35,77-80` | Verified |
+| PodAdvertisement parses `podId`, `lotNo`, `sequenceNo` from service UUID array | `PodAdvertisement.swift:52-67` | Verified |
+| BLE service UUID is `00004024-0000-1000-8000-00805f9b34fb` | `BluetoothServices.swift:30` | Verified |
+| Matching happens without BLE connection (from advertisement data) | `BluetoothManager.swift:331` | Verified |
+| `BluetoothManager` has `discoverPods()` and `startScanning()` | `BluetoothManager.swift:154,239` | Verified |
+| Crashlytics integration via default Firebase app | `AppDelegate.swift:12` | Verified |
+| Garmin uses secondary Firebase app instance | `GarminFirebaseConfig.swift:12-33` | Verified |
+| Garmin credentials are build-time placeholder constants | `GarminFirebaseConfig.swift:23-34` | Verified |
+| Therapy settings stored as JSON via `FileStorage` | `FileStorage.swift`, settings constants | Verified |
+| Settings file paths match (`settings/basal_profile.json`, etc.) | `Constants.swift:35-39` | Verified |
+
+### 17.2 Corrections Made
+
+| Original Claim | Correction | Impact |
+|---|---|---|
+| `bleIdentifier: String?` | Actually `String` (non-optional) | Recovery must assign placeholder before re-discovery |
+| `activeAlertSlots` rawValue key `"activeAlertSlots"` | Actual key is `"alerts"` | Would break manual field inspection (not rawValue round-trip) |
+| `firmwareVersion: FirmwareVersion` | Actually `String` | No functional impact |
+| `ck: Data`, `noncePrefix: Data` | Actually `Data?` (optional) | Must handle nil in early session states |
+| Missing fields | `setupUnitsDelivered` and `primeFinishTime` not in original table | Captured by rawValue automatically; added to spec table |
+| `PodAdvertisement` field name | Spec says `lotSeq`, code uses `sequenceNo` | Use `sequenceNo` when accessing `PodAdvertisement` |
+
+### 17.3 Sync Hook Points Identified
+
+Pod command completion in `OmniBLEPumpManager.swift` follows a consistent pattern. Backup sync should be triggered after dose storage succeeds. Key locations:
+
+| Operation | Method | Lines | Hook Point |
+|---|---|---|---|
+| Bolus | `enactBolus(units:activationType:completion:)` | 1860-1932 | After `session.dosesForStorage()` at line 1921 |
+| Temp Basal | `runTemporaryBasalProgram(...)` | 2003-2143 | After `session.dosesForStorage()` at line 2115 |
+| Suspend | `suspendDelivery(...)` | 1720-1815 | After `session.dosesForStorage()` at line 1762 |
+| Dose Storage | `store(doses:in:session:)` | 2439-2459 | After `lastPumpDataReportDate` update at line 2454 |
+| All commands | `store(doses:completion:)` | 2461-2477 | **Optimal single hook point** — all commands flow through here |
+
+**Recommended approach:** Hook sync at `store(doses:completion:)` (line 2461) — this is the funnel point for all pod command completions. A single hook here covers bolus, temp basal, suspend, resume, and status reads.
+
+---
+
+*This document is a pre-implementation specification. It describes intent and design, not completed code. All implementation decisions are subject to revision as development proceeds. Validated against OmniBLE commit d8375ebf, April 2026.*
