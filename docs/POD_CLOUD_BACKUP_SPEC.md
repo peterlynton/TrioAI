@@ -130,7 +130,7 @@ The primary strategy is to serialize the entire `OmniBLEPumpManagerState.rawValu
 |---|---|---|---|
 | `ltk` | `Data` | `"ltk"` (hex string) | Master secret; required to establish any new session |
 | `address` | `UInt32` | `"address"` | Pod address for BLE targeting and re-discovery matching |
-| `bleIdentifier` | `String?` | `"bleIdentifier"` | Stored but replaced during re-discovery on new device |
+| `bleIdentifier` | `String` | `"bleIdentifier"` | **Non-optional** (verified). Stored but replaced during re-discovery on new device |
 | `activatedAt` | `Date?` | `"activatedAt"` | Pod start time; needed for expiry calculation |
 | `expiresAt` | `Date?` | `"expiresAt"` | Pod expiry; used for Firestore TTL and UI |
 | `lotNo` | `UInt32` | `"lotNo"` | Lot number; used for re-discovery advertisement matching |
@@ -145,16 +145,18 @@ The primary strategy is to serialize the entire `OmniBLEPumpManagerState.rawValu
 | `unfinalizedResume` | `UnfinalizedDose?` | `"unfinalizedResume"` | In-flight resume not yet confirmed |
 | `finalizedDoses` | `[UnfinalizedDose]` | `"finalizedDoses"` | Completed doses pending upload |
 | `configuredAlerts` | `[AlertSlot: PodAlert]` | `"configuredAlerts"` | Alerts currently configured on pod |
-| `activeAlertSlots` | `AlertSet` | `"activeAlertSlots"` | Currently firing alerts |
+| `activeAlertSlots` | `AlertSet` | `"alerts"` | Currently firing alerts. **Note:** rawValue key is `"alerts"`, not `"activeAlertSlots"` |
 | `setupProgress` | `SetupProgress` | `"setupProgress"` | Is the pod fully activated? |
-| `firmwareVersion` | `FirmwareVersion` | `"firmwareVersion"` | Pod firmware; protocol compatibility |
-| `bleFirmwareVersion` | `FirmwareVersion` | `"bleFirmwareVersion"` | BLE chip firmware version |
+| `firmwareVersion` | `String` | `"firmwareVersion"` | Pod firmware; protocol compatibility. **Note:** type is `String`, not `FirmwareVersion` |
+| `bleFirmwareVersion` | `String` | `"bleFirmwareVersion"` | BLE chip firmware version. **Note:** type is `String`, not `FirmwareVersion` |
 | `podTime` | `TimeInterval` | `"podTime"` | Time elapsed on pod clock |
 | `podTimeUpdated` | `Date?` | `"podTimeUpdated"` | When pod time was last read |
 | `activeTime` | `TimeInterval?` | `"activeTime"` | Total active time |
 | `fault` | `DetailedStatus?` | `"fault"` | Pod fault state if any |
 | `unacknowledgedCommand` | `PendingCommand?` | `"unacknowledgedCommand"` | Command awaiting acknowledgment |
 | `messageTransportState` | `MessageTransportState` | `"messageTransportState"` | Full session counter state (see below) |
+| `setupUnitsDelivered` | `Double?` | `"setupUnitsDelivered"` | **Missing from original spec.** Units delivered during pod setup/priming |
+| `primeFinishTime` | `Date?` | `"primeFinishTime"` | **Missing from original spec.** When pod priming completed |
 
 **Fields on `MessageTransportState`** (nested in `PodState.rawValue["messageTransportState"]`):
 
@@ -164,8 +166,8 @@ The primary strategy is to serialize the entire `OmniBLEPumpManagerState.rawValu
 | `msgSeq` | `Int` | `"msgSeq"` | Message packet sequence number |
 | `nonceSeq` | `Int` | `"nonceSeq"` | Nonce counter; must not repeat |
 | `messageNumber` | `Int` | `"messageNumber"` | Omnipod command sequence |
-| `ck` | `Data` | `"ck"` | Current session cipher key (ephemeral) |
-| `noncePrefix` | `Data` | `"noncePrefix"` | Current nonce prefix (ephemeral) |
+| `ck` | `Data?` | `"ck"` | Current session cipher key (ephemeral). **Note:** optional (`Data?`), nil before first session |
+| `noncePrefix` | `Data?` | `"noncePrefix"` | Current nonce prefix (ephemeral). **Note:** optional (`Data?`), nil before first session |
 
 **Additional top-level fields on `OmniBLEPumpManagerState`** (`OmniBLE/OmniBLE/PumpManager/OmniBLEPumpManagerState.swift`):
 
